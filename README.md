@@ -1,5 +1,5 @@
 # mpd_no_upsample
-patch for MPD that adds a "no_upsample" parameter mpd.conf that suppresses soxr upsampling.
+patch for MPD that adds a "no_upsample" parameter to mpd.conf that suppresses soxr upsampling.
 
 Usage: add <no_upsample "yes"> to your mpd.conf file to enable this feature.  When enabled, MPD will avoid using soxr to upsample input streams that are at or below the audio_outout_format sample rate.
 
