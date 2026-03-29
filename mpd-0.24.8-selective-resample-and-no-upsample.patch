@@ -1,0 +1,303 @@
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/Main.cxx src/Main.cxx
+--- src.orig/Main.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/Main.cxx	2026-03-20 00:02:33.000000000 +0000
+@@ -270,6 +270,26 @@
+ 					 partition_config);
+ 	auto &partition = instance.partitions.back();
+ 
++	const unsigned selective_resample_mode =
++		partition_config.player.selective_resample_mode;
++	const bool no_upsample = partition_config.player.no_upsample;
++
++	if (selective_resample_mode > 0 &&
++	    !partition_config.player.audio_format.IsDefined()) {
++		FmtWarning(config_domain,
++			   "Missing audio_output_format - selective_resample_mode is deactivated.");
++	} else if (selective_resample_mode > 0 &&
++		   partition_config.player.audio_format.sample_rate % 48000 != 0) {
++		FmtWarning(config_domain,
++			   "For selective_resample_mode the audio_output_format should be a multiple of 48kHz.");
++	}
++
++	if (no_upsample &&
++	    !partition_config.player.audio_format.IsDefined()) {
++		FmtWarning(config_domain,
++			   "Missing audio_output_format - no_upsample has no effect.");
++	}
++
+ 	partition.replay_gain_mode = config.With(ConfigOption::REPLAYGAIN, [](const char *s){
+ 		return s != nullptr
+ 			? FromString(s)
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/config/Option.hxx src/config/Option.hxx
+--- src.orig/config/Option.hxx	2026-03-19 23:53:44.000000000 +0000
++++ src/config/Option.hxx	2026-03-20 00:01:14.000000000 +0000
+@@ -62,6 +62,9 @@
+ 
+ 	MIXRAMP_ANALYZER,
+ 
++	SELECTIVE_RESAMPLE_MODE,
++	NO_UPSAMPLE,
++
+ 	MAX
+ };
+ 
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/config/PlayerConfig.cxx src/config/PlayerConfig.cxx
+--- src.orig/config/PlayerConfig.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/config/PlayerConfig.cxx	2026-03-20 00:01:27.000000000 +0000
+@@ -52,6 +52,8 @@
+ 		 return ParseAudioFormat(s, true);
+ 	 })),
+ 	 replay_gain(config),
++	 selective_resample_mode(config.GetUnsigned(ConfigOption::SELECTIVE_RESAMPLE_MODE, 0)),
++	 no_upsample(config.GetBool(ConfigOption::NO_UPSAMPLE, false)),
+ 	 mixramp_analyzer(config.GetBool(ConfigOption::MIXRAMP_ANALYZER, false))
+ {
+ }
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/config/PlayerConfig.hxx src/config/PlayerConfig.hxx
+--- src.orig/config/PlayerConfig.hxx	2026-03-19 23:53:44.000000000 +0000
++++ src/config/PlayerConfig.hxx	2026-03-20 00:01:22.000000000 +0000
+@@ -25,6 +25,10 @@
+ 
+ 	bool mixramp_analyzer = false;
+ 
++	unsigned selective_resample_mode = 0;
++
++	bool no_upsample = false;
++
+ 	PlayerConfig() = default;
+ 
+ 	explicit PlayerConfig(const ConfigData &config);
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/config/Templates.cxx src/config/Templates.cxx
+--- src.orig/config/Templates.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/config/Templates.cxx	2026-03-20 00:01:18.000000000 +0000
+@@ -58,6 +58,8 @@
+ 	{ "auto_update" },
+ 	{ "auto_update_depth" },
+ 	{ "mixramp_analyzer" },
++	{ "selective_resample_mode" },
++	{ "no_upsample" },
+ };
+ 
+ static constexpr unsigned n_config_param_templates =
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/decoder/Control.cxx src/decoder/Control.cxx
+--- src.orig/decoder/Control.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/decoder/Control.cxx	2026-03-20 00:01:50.000000000 +0000
+@@ -11,11 +11,15 @@
+ DecoderControl::DecoderControl(Mutex &_mutex, Cond &_client_cond,
+ 			       InputCacheManager *_input_cache,
+ 			       const AudioFormat _configured_audio_format,
++			       unsigned _selective_resample_mode,
++			       bool _no_upsample,
+ 			       const ReplayGainConfig &_replay_gain_config) noexcept
+ 	:thread(BIND_THIS_METHOD(RunThread)),
+ 	 input_cache(_input_cache),
+ 	 mutex(_mutex), client_cond(_client_cond),
+ 	 configured_audio_format(_configured_audio_format),
++	 selective_resample_mode(_selective_resample_mode),
++	 no_upsample(_no_upsample),
+ 	 replay_gain_config(_replay_gain_config) {}
+ 
+ DecoderControl::~DecoderControl() noexcept
+@@ -34,7 +38,9 @@
+ 	assert(audio_format.IsValid());
+ 
+ 	in_audio_format = audio_format;
+-	out_audio_format = audio_format.WithMask(configured_audio_format);
++	out_audio_format = audio_format.WithMask(configured_audio_format,
++						 selective_resample_mode,
++						 no_upsample);
+ 
+ 	seekable = _seekable;
+ 	total_time = _duration;
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/decoder/Control.hxx src/decoder/Control.hxx
+--- src.orig/decoder/Control.hxx	2026-03-19 23:53:44.000000000 +0000
++++ src/decoder/Control.hxx	2026-03-20 00:01:39.000000000 +0000
+@@ -110,6 +110,18 @@
+ 	 */
+ 	const AudioFormat configured_audio_format;
+ 
++	/**
++	 * The "selective_resample_mode" setting.
++	 */
++	unsigned selective_resample_mode = 0;
++
++	/**
++	 * The "no_upsample" setting.  When true, resampling is
++	 * suppressed for input streams whose sample rate is at or
++	 * below the configured audio_output_format rate.
++	 */
++	bool no_upsample = false;
++
+ public:
+ 	/** the format of the song file */
+ 	AudioFormat in_audio_format;
+@@ -168,6 +180,8 @@
+ 	DecoderControl(Mutex &_mutex, Cond &_client_cond,
+ 		       InputCacheManager *_input_cache,
+ 		       const AudioFormat _configured_audio_format,
++		       unsigned _selective_resample_mode,
++		       bool _no_upsample,
+ 		       const ReplayGainConfig &_replay_gain_config) noexcept;
+ 	~DecoderControl() noexcept;
+ 
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/pcm/AudioFormat.cxx src/pcm/AudioFormat.cxx
+--- src.orig/pcm/AudioFormat.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/pcm/AudioFormat.cxx	2026-03-20 05:58:35.645998193 +0000
+@@ -7,15 +7,119 @@
+ #include <cassert>
+ 
+ #include <stdio.h>
++#include <map>
++
++static const std::map<unsigned, unsigned> lut48to44 = {
++	{768000, 705600 },
++	{384000, 352800 },
++	{192000, 176400 },
++	 {96000,  88200 },
++	 {48000,  44100 }
++};
++
++static const std::map<unsigned, unsigned> lut44to48 = {
++	{705600, 384000 },
++	{352800, 192000 },
++	{176400,  96000 },
++	 {88200,  48000 }
++};
++
++static constexpr unsigned ADHERE_BASE_CLOCK = 0x08;
++static constexpr unsigned UPSAMPLE_MASK = 0x03;
++
++static constexpr unsigned UP_AND_DOWN_SAMPLE = 0x0;
++static constexpr unsigned UPSAMPLE_ALL = 0x03;
++static constexpr unsigned UPSAMPLE_ONLY_44 = 0x01;
++static constexpr unsigned UPSAMPLE_ONLY_48 = 0x02;
++
++/**
++ * Determine the output sample rate applying the selective resample mode.
++ *
++ * @param source_rate the sample rate of the current source
++ * @param target_rate the sample rate to convert to
++ * @param selective_resample_mode bitmask controlling resample behaviour
++ * @return the final sample rate to convert to
++ *
++ * selective_resample_mode flags:
++ * 0                 - up/down sample to match requested sample rate (regular behaviour)
++ * UPSAMPLE_ONLY_44  (0x01) - only upsample when source is 44.1kHz
++ * UPSAMPLE_ONLY_48  (0x02) - only upsample sources below 88.2kHz
++ * UPSAMPLE_ALL      (0x03) - only upsample when source < target
++ * ADHERE_BASE_CLOCK (0x08) - when resampling between clock families, snap
++ *   to the nearest same-family rate instead of the configured target rate
++ */
++static unsigned
++determine_selective_resample_rate(unsigned source_rate, unsigned target_rate,
++				  unsigned selective_resample_mode) noexcept
++{
++	const bool adhere_base_clock = (selective_resample_mode & ADHERE_BASE_CLOCK) == ADHERE_BASE_CLOCK;
++	bool resample = false;
++	unsigned out_sample_rate = source_rate;
++
++	if (target_rate) {
++		switch (selective_resample_mode & UPSAMPLE_MASK) {
++		case UPSAMPLE_ALL:
++			resample = source_rate < target_rate;
++			break;
++		case UPSAMPLE_ONLY_44:
++			resample = source_rate == 44100;
++			break;
++		case UPSAMPLE_ONLY_48:
++			resample = source_rate < 88200;
++			break;
++		default:
++			resample = true;
++		}
++
++		if (resample) {
++			if (adhere_base_clock &&
++			    source_rate % 44100 == 0 &&
++			    target_rate % 48000 == 0 &&
++			    lut48to44.find(target_rate) != lut48to44.end()) {
++				out_sample_rate = lut48to44.find(target_rate)->second;
++			} else if (adhere_base_clock &&
++				   source_rate % 48000 == 0 &&
++				   target_rate % 44100 == 0 &&
++				   lut44to48.find(target_rate) != lut44to48.end()) {
++				out_sample_rate = lut44to48.find(target_rate)->second;
++			} else {
++				out_sample_rate = target_rate;
++			}
++		}
++	}
++
++	return out_sample_rate;
++}
+ 
+ void
+-AudioFormat::ApplyMask(AudioFormat mask) noexcept
++AudioFormat::ApplyMask(AudioFormat mask,
++		       unsigned selective_resample_mode,
++		       bool no_upsample) noexcept
+ {
+ 	assert(IsValid());
+ 	assert(mask.IsMaskValid());
+ 
+-	if (mask.sample_rate != 0)
+-		sample_rate = mask.sample_rate;
++	if (no_upsample && mask.sample_rate != 0 &&
++	    sample_rate <= mask.sample_rate) {
++		/*
++		 * no_upsample: when the input sample rate is at or
++		 * below the configured audio_output_format rate,
++		 * skip the entire mask so the output is bit-perfect
++		 * passthrough — same sample rate, bit depth, and
++		 * channels as the source.
++		 */
++		return;
++	}
++
++	if (mask.sample_rate != 0) {
++		if (selective_resample_mode >= 1) {
++			sample_rate = determine_selective_resample_rate(
++				sample_rate, mask.sample_rate,
++				selective_resample_mode);
++		} else {
++			sample_rate = mask.sample_rate;
++		}
++	}
+ 
+ 	if (mask.format != SampleFormat::UNDEFINED)
+ 		format = mask.format;
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/pcm/AudioFormat.hxx src/pcm/AudioFormat.hxx
+--- src.orig/pcm/AudioFormat.hxx	2026-03-19 23:53:44.000000000 +0000
++++ src/pcm/AudioFormat.hxx	2026-03-20 00:02:00.000000000 +0000
+@@ -105,12 +105,16 @@
+ 		return !(*this == other);
+ 	}
+ 
+-	void ApplyMask(AudioFormat mask) noexcept;
++	void ApplyMask(AudioFormat mask,
++		       unsigned selective_resample_mode = 0,
++		       bool no_upsample = false) noexcept;
+ 
+ 	[[gnu::pure]]
+-	AudioFormat WithMask(AudioFormat mask) const noexcept {
++	AudioFormat WithMask(AudioFormat mask,
++			     unsigned selective_resample_mode = 0,
++			     bool no_upsample = false) const noexcept {
+ 		AudioFormat result = *this;
+-		result.ApplyMask(mask);
++		result.ApplyMask(mask, selective_resample_mode, no_upsample);
+ 		return result;
+ 	}
+ 
+diff -ruN '--exclude=*.rej' '--exclude=*.orig' src.orig/player/Thread.cxx src/player/Thread.cxx
+--- src.orig/player/Thread.cxx	2026-03-19 23:53:44.000000000 +0000
++++ src/player/Thread.cxx	2026-03-20 00:01:54.000000000 +0000
+@@ -1256,6 +1256,8 @@
+ 	DecoderControl dc(mutex, cond,
+ 			  input_cache,
+ 			  config.audio_format,
++			  config.selective_resample_mode,
++			  config.no_upsample,
+ 			  config.replay_gain);
+ 	dc.StartThread();
+ 
